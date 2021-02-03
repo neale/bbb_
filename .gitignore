@@ -1,3 +1,5 @@
 fmnist/
 data_m/
 runs/
+mnist/
+plots/
