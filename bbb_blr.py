@@ -5,7 +5,6 @@
 import os
 import math
 import matplotlib
-matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
@@ -14,14 +13,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-from tensorboardX import SummaryWriter
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 from tqdm import tqdm, trange
 
 from scipy.stats import entropy
 
-def cov(self, data, rowvar=False):
+def cov(data, rowvar=False):
     """Estimate a covariance matrix given data.
 
     Args:
@@ -47,29 +45,7 @@ def cov(self, data, rowvar=False):
     x -= torch.mean(x, dim=1, keepdim=True)
     return fact * x.matmul(x.t()).squeeze()
 
-
-(train_data, train_target), (test_data, test_target) = generate_regression_data(80, 200)
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LOADER_KWARGS = {'num_workers': 1, 'pin_memory': True} if torch.cuda.is_available() else {}
-print(torch.cuda.is_available())
-
-BATCH_SIZE = 84
-TEST_BATCH_SIZE = 200
-
-TRAIN_SIZE = 84 #len(train_loader.dataset)
-TEST_SIZE = 200#len(test_loader.dataset)
-NUM_BATCHES = 1#len(train_loader)
-NUM_TEST_BATCHES = 1#len(test_loader)
-
-CLASSES = 1
-TRAIN_EPOCHS = 10000
-SAMPLES = 100
-TEST_SAMPLES = 100
-
-#assert (TRAIN_SIZE % BATCH_SIZE) == 0
-#assert (TEST_SIZE % TEST_BATCH_SIZE) == 0
-
 
 # ## Modelling
 class Gaussian(object):
@@ -84,7 +60,9 @@ class Gaussian(object):
         return torch.log1p(torch.exp(self.rho))
     
     def sample(self):
-        epsilon = self.normal.sample(self.rho.size()).to(DEVICE)
+        epsilon = self.normal.sample(self.rho.size())
+        print (epsilon, type(epsilon))
+        epsilon = epsilon.cuda()
         return self.mu + self.sigma * epsilon
     
     def log_prob(self, input):
@@ -118,56 +96,48 @@ class BayesianLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         # Weight parameters
-        self.weight_mu = nn.Parameter(torch.Tensor(out_features, in_features).uniform_(-0.2, 0.2))
-        self.weight_rho = nn.Parameter(torch.Tensor(out_features, in_features).uniform_(-5,-4))
+        self.weight_mu = nn.Parameter(
+            torch.Tensor(out_features, in_features).uniform_(-0.2, 0.2))
+        self.weight_rho = nn.Parameter(
+            torch.Tensor(out_features, in_features).uniform_(-5,-4))
         self.weight = Gaussian(self.weight_mu, self.weight_rho)
-        # Bias parameters
-        self.bias_mu = nn.Parameter(torch.Tensor(out_features).uniform_(-0.2, 0.2))
-        self.bias_rho = nn.Parameter(torch.Tensor(out_features).uniform_(-5,-4))
-        self.bias = Gaussian(self.bias_mu, self.bias_rho)
         # Prior distributions
         self.weight_prior = ScaleMixtureGaussian(PI, SIGMA_1, SIGMA_2)
-        self.bias_prior = ScaleMixtureGaussian(PI, SIGMA_1, SIGMA_2)
         self.log_prior = 0
         self.log_variational_posterior = 0
 
     def forward(self, input, sample=False, calculate_log_probs=False):
         if self.training or sample:
             weight = self.weight.sample()
-            bias = self.bias.sample()
         else:
             weight = self.weight.mu
-            bias = self.bias.mu
         if self.training or calculate_log_probs:
-            self.log_prior = self.weight_prior.log_prob(weight) + self.bias_prior.log_prob(bias)
-            self.log_variational_posterior = self.weight.log_prob(weight) + self.bias.log_prob(bias)
+            self.log_prior = self.weight_prior.log_prob(weight)
+            self.log_variational_posterior = self.weight.log_prob(weight)
         else:
             self.log_prior, self.log_variational_posterior = 0, 0
 
-        return F.linear(input, weight, bias)
+        return F.linear(input, weight)
 
 class BayesianNetwork(nn.Module):
     def __init__(self):
         super().__init__()
-        self.l1 = BayesianLinear(1, 50)
-        self.l2 = BayesianLinear(50, 1)
+        self.l1 = BayesianLinear(3, 1)
     
     def forward(self, x, sample=False):
-        #x = x.view(-1, 28)
-        x = F.relu(self.l1(x, sample))
-        x = self.l2(x, sample)
+        x = self.l1(x, sample)
         return x
     
     def log_prior(self):
-        return self.l1.log_prior + self.l2.log_prior
+        return self.l1.log_prior
     
     def log_variational_posterior(self):
-        return self.l1.log_variational_posterior+ self.l2.log_variational_posterior+ self.l2.log_variational_posterior
+        return self.l1.log_variational_posterior
     
-    def sample_elbo(self, input, target, samples=SAMPLES):
-        outputs = torch.zeros(samples, BATCH_SIZE, CLASSES).to(DEVICE)
-        log_priors = torch.zeros(samples).to(DEVICE)
-        log_variational_posteriors = torch.zeros(samples).to(DEVICE)
+    def sample_elbo(self, input, target, samples=10):
+        outputs = torch.zeros(samples, train_batch_size, 1).cuda()
+        log_priors = torch.zeros(samples).cuda()
+        log_variational_posteriors = torch.zeros(samples).cuda()
         for i in range(samples):
             out = self(input, sample=True)
             outputs[i] = out
@@ -176,77 +146,63 @@ class BayesianNetwork(nn.Module):
         log_prior = log_priors.mean()
         log_variational_posterior = log_variational_posteriors.mean()
         negative_log_likelihood = F.mse_loss(outputs.mean(0), target, reduction='sum')
-        loss = (log_variational_posterior - log_prior)/NUM_BATCHES + negative_log_likelihood
+        loss = (log_variational_posterior - log_prior) + negative_log_likelihood
         return loss, log_prior, log_variational_posterior, negative_log_likelihood
 
-net = BayesianNetwork().to(DEVICE)
+net = BayesianNetwork().cuda()
+
+input_size = 3
+train_batch_size = 10
+output_dim = 1
+batch_size = 100
+inputs = torch.randn(batch_size, input_size)
+beta = torch.rand(input_size, output_dim) + 5.
+noise = torch.randn(batch_size, output_dim)
+targets = inputs @ beta + noise
+true_cov = torch.inverse(
+        inputs.t() @ inputs)  # + torch.eye(input_size))
+true_mean = true_cov @ inputs.t() @ targets
 
 def train(net, optimizer, epoch):
     net.train()
-    data = train_data
-    target = train_target
-    data, target = data.to(DEVICE), target.to(DEVICE)
     net.zero_grad()
-    loss, log_prior, log_variational_posterior, negative_log_likelihood = net.sample_elbo(data, target)
+    perm = torch.randperm(batch_size)
+    idx = perm[:train_batch_size]
+    train_inputs = inputs[idx].cuda()
+    train_targets = targets[idx].cuda()
+
+    loss, log_prior, log_variational_posterior, negative_log_likelihood = net.sample_elbo(train_inputs, train_targets)
     loss.backward()
     optimizer.step()
 
-def test_ensemble():
-    net.eval()
-    data = test_data.cuda()
-    target = test_target.cuda()
-    with torch.no_grad():
-        data, target = data.to(DEVICE), target.to(DEVICE)
-        outputs = torch.zeros(TEST_SAMPLES+1, TEST_BATCH_SIZE, CLASSES).to(DEVICE)
-        for i in range(TEST_SAMPLES):
-            outputs[i] = net(data, sample=True)
-        outputs[TEST_SAMPLES] = net(data, sample=False)
-        output = outputs.mean(0)
-        mse = (output - target).pow(2).mean()
-    print('posterior_mean MSE: {}'.format(mse))
+def test_ensemble(i):
+    weight_samples = []
+    preds = []
+    for i in range(100):
+        sample_w1 = net.l1.weight.sample().view(-1)
+        weight_samples.append(sample_w1)
+        preds.append(net(inputs, sample=True))
+    preds = torch.stack(preds)
+    weight_samples = torch.stack(weight_samples)
+    computed_mean = weight_samples.mean(0)
+    computed_cov = cov(weight_samples)
+    computed_preds = inputs @ computed_mean
+    preds = net(inputs, sample=True)
+    pred_err = torch.norm((preds - targets).mean(0))
+    mean_err = torch.norm(computed_mean - true_mean.squeeze())
+    mean_err = mean_err / torch.norm(true_mean)
 
+    cov_err = torch.norm(computed_cov - true_cov)
+    cov_err = cov_err / torch.norm(true_cov)
+
+    print("train_iter {}: pred err {}".format(i, pred_err))
+    print("train_iter {}: mean err {}".format(i, mean_err))
+    print("train_iter {}: cov err {}".format(i, cov_err))
+    print("computed_cov norm: {}".format(computed_cov.norm()))
 
 optimizer = optim.Adam(net.parameters())
-for epoch in range(TRAIN_EPOCHS):
+for epoch in range(50000):
     train(net, optimizer, epoch)
-test_ensemble()
-plot_bnn_regression(net, data=None)
-
-def show(img):
-    npimg = img.numpy()
-    plt.imshow(np.transpose(npimg, (1,2,0)), interpolation='nearest')
-
-
-fmnist_sample = iter(test_loader).next()
-fmnist_sample[0] = fmnist_sample[0].to(DEVICE)
-print(fmnist_sample[1])
-sns.set_style("dark")
-show(make_grid(fmnist_sample[0].cpu()))
-
-
-# #### Out-of-Domain Uncertainty
-
-mnist_loader = val_loader
-
-mnist_sample = iter(mnist_loader).next()
-mnist_sample[0] = mnist_sample[0].to(DEVICE)
-sns.set_style("dark")
-show(make_grid(mnist_sample[0].cpu()))
-
-
-net.eval()
-mnist_outputs = net(mnist_sample[0], True).max(1, keepdim=True)[1].detach().cpu().numpy()
-for _ in range(99):
-    mnist_outputs = np.append(mnist_outputs, net(mnist_sample[0], True).max(1, keepdim=True)[1].detach().cpu().numpy(), axis=1)
-
-sns.set_style("darkgrid")
-plt.subplots(5,1,figsize=(10,4))
-for i in range(5):
-    plt.subplot(5,1,i+1)
-    plt.ylim(0,100)
-    plt.xlabel("Categories")
-    plt.xticks(range(10), ["Top", "Trouser", "Pullover", "Dress", "Coat", "Sandal", "Shirt", "Sneaker", "Bag", "Ankle Boot"])
-    plt.ylabel("Count")
-    plt.yticks(range(50,101,50))
-    plt.hist(mnist_outputs[i], np.arange(-0.5, 10, 1))
-
+    if epoch % 1000 == 0:
+        test_ensemble(epoch)
+test_ensemble(epoch)
