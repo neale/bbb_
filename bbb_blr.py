@@ -15,7 +15,6 @@ import torch.optim as optim
 
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid
-from tqdm import tqdm, trange
 
 from scipy.stats import entropy
 
@@ -45,8 +44,8 @@ def cov(data, rowvar=False):
     x -= torch.mean(x, dim=1, keepdim=True)
     return fact * x.matmul(x.t()).squeeze()
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+torch.set_default_tensor_type(torch.cuda.FloatTensor)
 # ## Modelling
 class Gaussian(object):
     def __init__(self, mu, rho):
@@ -61,8 +60,7 @@ class Gaussian(object):
     
     def sample(self):
         epsilon = self.normal.sample(self.rho.size())
-        print (epsilon, type(epsilon))
-        epsilon = epsilon.cuda()
+        epsilon = epsilon.cuda(0)
         return self.mu + self.sigma * epsilon
     
     def log_prob(self, input):
@@ -86,10 +84,13 @@ class ScaleMixtureGaussian(object):
         return (torch.log(self.pi * prob1 + (1-self.pi) * prob2)).sum()
 
 
-PI = 0.5
-SIGMA_1 = torch.cuda.FloatTensor([math.exp(-0)])
-SIGMA_2 = torch.cuda.FloatTensor([math.exp(-6)])
+#PI = 0.5
+SIGMA_1 = torch.cuda.FloatTensor([0])
+SIGMA_2 = torch.cuda.FloatTensor([0])
 
+PI = 0.1
+#SIGMA_1 = torch.cuda.FloatTensor([math.exp(1)])
+#SIGMA_2 = torch.cuda.FloatTensor([math.exp(1)])
 class BayesianLinear(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
@@ -97,12 +98,15 @@ class BayesianLinear(nn.Module):
         self.out_features = out_features
         # Weight parameters
         self.weight_mu = nn.Parameter(
-            torch.Tensor(out_features, in_features).uniform_(-0.2, 0.2))
+            torch.zeros(out_features, in_features))
+            #torch.Tensor(out_features, in_features).uniform_(-0.2, 0.2))
         self.weight_rho = nn.Parameter(
-            torch.Tensor(out_features, in_features).uniform_(-5,-4))
+            torch.zeros(out_features, in_features))
+            #torch.Tensor(out_features, in_features).uniform_(-5,-4))
         self.weight = Gaussian(self.weight_mu, self.weight_rho)
         # Prior distributions
-        self.weight_prior = ScaleMixtureGaussian(PI, SIGMA_1, SIGMA_2)
+        #self.weight_prior = ScaleMixtureGaussian(PI, SIGMA_1, SIGMA_2)
+        self.weight_prior = Gaussian(0, SIGMA_1)
         self.log_prior = 0
         self.log_variational_posterior = 0
 
@@ -117,7 +121,7 @@ class BayesianLinear(nn.Module):
         else:
             self.log_prior, self.log_variational_posterior = 0, 0
 
-        return F.linear(input, weight)
+        return torch.matmul(input.cuda(0), weight.t().cuda(0))
 
 class BayesianNetwork(nn.Module):
     def __init__(self):
@@ -135,9 +139,9 @@ class BayesianNetwork(nn.Module):
         return self.l1.log_variational_posterior
     
     def sample_elbo(self, input, target, samples=10):
-        outputs = torch.zeros(samples, train_batch_size, 1).cuda()
-        log_priors = torch.zeros(samples).cuda()
-        log_variational_posteriors = torch.zeros(samples).cuda()
+        outputs = torch.zeros(samples, train_batch_size, 1).cuda(0)
+        log_priors = torch.zeros(samples).cuda(0)
+        log_variational_posteriors = torch.zeros(samples).cuda(0)
         for i in range(samples):
             out = self(input, sample=True)
             outputs[i] = out
@@ -149,7 +153,7 @@ class BayesianNetwork(nn.Module):
         loss = (log_variational_posterior - log_prior) + negative_log_likelihood
         return loss, log_prior, log_variational_posterior, negative_log_likelihood
 
-net = BayesianNetwork().cuda()
+net = BayesianNetwork().cuda(0)
 
 input_size = 3
 train_batch_size = 10
@@ -161,15 +165,15 @@ noise = torch.randn(batch_size, output_dim)
 targets = inputs @ beta + noise
 true_cov = torch.inverse(
         inputs.t() @ inputs)  # + torch.eye(input_size))
-true_mean = true_cov @ inputs.t() @ targets
+true_mean = (true_cov @ inputs.t() @ targets).cuda(0)
 
 def train(net, optimizer, epoch):
     net.train()
     net.zero_grad()
     perm = torch.randperm(batch_size)
     idx = perm[:train_batch_size]
-    train_inputs = inputs[idx].cuda()
-    train_targets = targets[idx].cuda()
+    train_inputs = inputs[idx].cuda(0)
+    train_targets = targets[idx].cuda(0)
 
     loss, log_prior, log_variational_posterior, negative_log_likelihood = net.sample_elbo(train_inputs, train_targets)
     loss.backward()
@@ -178,17 +182,17 @@ def train(net, optimizer, epoch):
 def test_ensemble(i):
     weight_samples = []
     preds = []
-    for i in range(100):
+    for _ in range(10):
         sample_w1 = net.l1.weight.sample().view(-1)
         weight_samples.append(sample_w1)
-        preds.append(net(inputs, sample=True))
+        preds.append(net(inputs.cuda(0), sample=True))
     preds = torch.stack(preds)
     weight_samples = torch.stack(weight_samples)
-    computed_mean = weight_samples.mean(0)
+    computed_mean = weight_samples.mean(0).cuda(0)
     computed_cov = cov(weight_samples)
-    computed_preds = inputs @ computed_mean
-    preds = net(inputs, sample=True)
-    pred_err = torch.norm((preds - targets).mean(0))
+    computed_preds = inputs.cuda(0) @ computed_mean.cuda(0)
+    preds = net(inputs.cuda(0), sample=True)
+    pred_err = torch.norm((preds - targets.cuda(0)).mean(0))
     mean_err = torch.norm(computed_mean - true_mean.squeeze())
     mean_err = mean_err / torch.norm(true_mean)
 
@@ -200,7 +204,7 @@ def test_ensemble(i):
     print("train_iter {}: cov err {}".format(i, cov_err))
     print("computed_cov norm: {}".format(computed_cov.norm()))
 
-optimizer = optim.Adam(net.parameters())
+optimizer = optim.Adam(net.parameters(), lr=1e-4)
 for epoch in range(50000):
     train(net, optimizer, epoch)
     if epoch % 1000 == 0:
